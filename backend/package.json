@@ -1,0 +1,32 @@
+{
+  "name": "notebook-rag-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "worker": "node src/workers/worker.js",
+    "worker:dev": "node --watch src/workers/worker.js",
+    "worker:indexing": "node src/workers/indexing.worker.js",
+    "worker:query": "node src/workers/query.worker.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev --name init"
+  },
+  "dependencies": {
+    "@clerk/express": "^2.1.52",
+    "@prisma/client": "^5.19.0",
+    "@qdrant/js-client-rest": "^1.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "inngest": "^4.18.1",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.60.0",
+    "pdf-parse": "^1.1.1",
+    "uuid": "^9.0.1",
+    "youtube-transcript": "^1.2.1"
+  },
+  "devDependencies": {
+    "prisma": "^5.19.0"
+  }
+}
