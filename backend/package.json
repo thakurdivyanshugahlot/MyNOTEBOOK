@@ -5,12 +5,10 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "worker": "node src/workers/worker.js",
-    "worker:dev": "node --watch src/workers/worker.js",
-    "worker:indexing": "node src/workers/indexing.worker.js",
-    "worker:query": "node src/workers/query.worker.js",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev --name init"
+    "prisma:migrate": "prisma migrate dev --name init",
+    "prisma:deploy": "prisma migrate deploy",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@clerk/express": "^2.1.52",

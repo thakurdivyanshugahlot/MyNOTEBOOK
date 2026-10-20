@@ -2,7 +2,8 @@
 
 A NotebookLM-style app: create notebooks, add sources (PDF, plain text, website URL,
 YouTube video, VTT/transcript), and ask grounded questions with citations back to
-the exact source.
+the relevant page, timestamp, or excerpt. Sign in with Clerk to keep notebooks
+private to your account.
 
 ```
 MyNOTEBOOK/
@@ -12,34 +13,39 @@ MyNOTEBOOK/
 
 ## Architecture
 
+**User flow:**
+1. Sign in or create an account with Clerk.
+2. Create a notebook, then open it to manage its sources and ask questions.
+3. Add a PDF, text file, VTT/SRT transcript, website URL, or YouTube URL. Files
+   are limited to 50 MB. The source list refreshes while a source is being indexed.
+4. Once a source is ready, ask a question. The answer streams into the chat and
+   citation badges open the cited excerpt, page, or timestamp.
+
 **Ingestion (async via Inngest):**
 ```
-Upload/Link → Source row created (status: uploading)
-            → Inngest event "source/index.requested" sent
-            → indexSource function starts (status: indexing)
-                → parse (by type: pdf / text / vtt / website / youtube)
-                → chunk (timestamp-aware for vtt/youtube, sliding-window for text/pdf/website)
-                → embed (OpenAI text-embedding-3-small, 1536-dim)
-                → upsert into Qdrant, tagged with notebookId + sourceId
-            → status: ready (or failed, with errorMessage)
+Upload/link → authenticated API creates a source row (status: uploading)
+            → event "source/index.requested" sent to Inngest
+            → indexSource marks it indexing, parses and chunks the content
+            → OpenAI creates embeddings; chunks are stored in Qdrant
+            → source status becomes ready (or failed, with an error message)
 ```
 
 **Querying (async + streamed via Inngest realtime):**
 ```
-User question
-  → POST /api/notebooks/:id/query validates the input and sends "notebook/query.requested"
-  → queryNotebook Inngest function rewrites and expands the question
-  → it generates HyDE and embedding variants, then searches Qdrant filtered to the notebook
-  → results are merged using reciprocal rank fusion and the best chunks are selected
-  → the function uses the selected chunks as grounded context for the OpenAI answer
-  → tokens are published back to the browser over SSE/realtime and a final "done" event carries citations
+Question → authenticated API validates it and sends "notebook/query.requested"
+         → queryNotebook rewrites and expands the question, including HyDE
+         → searches Qdrant for each variant, filtered to this notebook
+         → reciprocal rank fusion selects the most relevant chunks
+         → OpenAI streams an answer grounded in those chunks
+         → Inngest Realtime sends answer tokens and a final event with citations
 ```
 
-Why Inngest replaces the older worker queue: the app is event-driven, retries are built in, and the workflow model maps directly to long-running indexing and streaming query jobs without depending on Redis/BullMQ infrastructure.
+Inngest runs indexing and query workflows with retries and realtime events. Run
+its local development server alongside the API when developing locally.
 
 **Notebook isolation:** every vector stored in Qdrant carries a `notebookId`
-in its payload, and every search filters on it. One notebook's sources can
-never leak into another's answers.
+in its payload, and every search filters on it. The API also scopes notebooks
+and sources to the signed-in Clerk user.
 
 ## Source viewer — what "click a citation" does per type
 
@@ -47,13 +53,12 @@ never leak into another's answers.
 |---|---|
 | YouTube | Opens the video in a new tab with `&t=<seconds>s` at the cited moment |
 | Website | Opens the original URL in a new tab |
-| PDF / Text / VTT | Shows the exact cited excerpt in a modal (these are uploaded files with no public URL to deep-link into) |
+| PDF | Shows the cited excerpt and page number in a modal; it does not open an inline PDF viewer |
+| Text / VTT | Shows the cited excerpt in a modal |
 
-This is a deliberate scope decision for an assignment timeframe — a true inline
-PDF-page-jump viewer (rendering the PDF in-browser and scrolling to the exact
-page) is a reasonable v2 addition; for now the cited excerpt + source name is
-shown directly, which still satisfies "never receive an answer without knowing
-where it came from."
+Websites and YouTube videos can be opened at their original URL or cited
+timestamp. Uploaded files have no public URL, so the modal shows the excerpt
+and any available page or timestamp metadata.
 
 ## Setup
 
@@ -64,34 +69,51 @@ docker compose up -d
 docker compose ps   # confirm Qdrant is "Up"
 ```
 
-### 2. Backend
+The compose file also starts Redis, but the current application flow uses
+Inngest rather than Redis for its background workflows.
+
+### 2. Backend and Inngest
 ```bash
 cd backend
 npm install
-cp .env.example .env
-# fill in OPENAI_API_KEY, QDRANT_API_KEY, and Clerk values in .env
-npx prisma generate
-npx prisma migrate dev --name init
-mkdir -p uploads
+npm run prisma:generate
+npm run prisma:migrate
 ```
 
-Run the API:
+Create `backend/.env` from `.env.example` (PowerShell: `Copy-Item .env.example
+.env`; macOS/Linux: `cp .env.example .env`) and set the required OpenAI and
+Clerk credentials. `QDRANT_API_KEY` is only needed when your Qdrant instance
+requires authentication. Create the upload directory if it does not exist
+(PowerShell: `New-Item -ItemType Directory -Force uploads`; macOS/Linux:
+`mkdir -p uploads`).
+
+Start the API in one terminal:
 ```bash
 npm start
 ```
 
-For local Inngest development, point the dev server at the API endpoint:
+Start the Inngest development server in another terminal, from `backend`:
 ```bash
-npx inngest dev -u http://localhost:8000/api/inngest
+npx --ignore-scripts=false inngest-cli@latest dev -u http://localhost:8000/api/inngest
 ```
 
 ### 3. Frontend
 ```bash
 cd frontend
 npm install
-cp .env.local.example .env.local
+```
+
+Create `frontend/.env.local` from `.env.local.example` and set
+`NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` to the publishable key for the same Clerk
+application used by the backend. For example, in PowerShell use
+`Copy-Item .env.local.example .env.local`; on macOS/Linux use
+`cp .env.local.example .env.local`. Then start the frontend:
+```bash
 npm run dev         # http://localhost:3000
 ```
+
+Open the frontend, sign in or sign up, create a notebook, add a source, and
+wait for its status to become `ready` before asking questions.
 
 ## Environment variables
 
@@ -109,14 +131,13 @@ npm run dev         # http://localhost:3000
 | `EMBEDDING_DIM` | Must match the embedding model's output size |
 | `UPLOAD_DIR` | Where uploaded files land before/while being parsed |
 | `RETRIEVAL_TOP_K` | How many chunks to retrieve per query (default 6) |
-| `CLERK_SECRET_KEY` | Backend Clerk secret used to validate authenticated requests |
+| `CLERK_SECRET_KEY` | Clerk secret key used by the backend to validate authenticated requests |
 
 **frontend/.env.local**
 | Var | Purpose |
 |---|---|
 | `NEXT_PUBLIC_API_URL` | Backend base URL, e.g. `http://localhost:8000/api` |
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Clerk public key for frontend auth |
-| `CLERK_SECRET_KEY` | Clerk secret key for server-side auth in the Next.js app |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Clerk publishable key for frontend sign-in and session tokens |
 
 ## API reference
 
@@ -132,14 +153,16 @@ npm run dev         # http://localhost:3000
 | POST | `/api/notebooks/:id/sources/link` | Add website/youtube (`{ type, url }`) |
 | DELETE | `/api/sources/:id` | Remove a source (vectors + file + row) |
 | POST | `/api/sources/:id/reindex` | Re-run indexing for a source |
-| POST | `/api/notebooks/:id/query` | Validates input, creates a realtime token, and emits an Inngest query event to stream results |
+| POST | `/api/notebooks/:id/query` | Validates input, returns a request ID and realtime token, and emits an Inngest query event |
 
-## Known limitations (by design, given assignment scope)
+All notebook and source routes require a valid Clerk session. The frontend
+passes its session token to the backend as a bearer token.
+
+## Known limitations
 
 - Website parsing is a lightweight fetch + HTML-strip — pages that render
   content client-side via JS won't extract well (no headless browser).
 - YouTube transcript fetch depends on the video having captions available;
   videos without any caption track can't be indexed.
-- Citation click for uploaded files (pdf/text/vtt) shows the excerpt inline
-  rather than opening an inline page-anchored PDF viewer.
-- No auth/multi-user support — this is a single-user local app.
+- Citations for uploaded files show the excerpt in a modal; PDFs are not
+  rendered in an inline page-anchored viewer.
