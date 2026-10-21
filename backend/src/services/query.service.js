@@ -163,19 +163,20 @@ export async function retrieveRelevantChunks({ notebookId, variants, topK }) {
 
   const embeddings = await generateEmbeddings(uniqueVariants);
   const searchLimit = Math.max(topK * SEARCH_LIMIT_MULTIPLIER, 6);
-  const searchResults = [];
 
-  for (let i = 0; i < uniqueVariants.length; i += 1) {
-    const vector = embeddings[i];
-    const results = await qdrantClient.search(COLLECTION_NAME, {
-      vector,
-      limit: searchLimit,
-      filter: { must: [{ key: "notebookId", match: { value: notebookId } }] },
-      with_payload: true,
-    });
-
-    searchResults.push(results);
-  }
+  // qdrantClient.search() was removed in @qdrant/js-client-rest 1.19+.
+  // query() takes `query` instead of `vector` and returns { points: [...] }.
+  const searchResults = await Promise.all(
+    uniqueVariants.map(async (_, i) => {
+      const response = await qdrantClient.query(COLLECTION_NAME, {
+        query: embeddings[i],
+        limit: searchLimit,
+        filter: { must: [{ key: "notebookId", match: { value: notebookId } }] },
+        with_payload: true,
+      });
+      return response.points;
+    }),
+  );
 
   const merged = rankByReciprocalRankFusion(searchResults);
   return merged.slice(0, topK).map((item) => ({
