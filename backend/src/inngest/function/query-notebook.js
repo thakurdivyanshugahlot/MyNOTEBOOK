@@ -11,108 +11,96 @@ import { streamGroundedAnswer } from "../../services/chat.service.js";
 
 export const queryNotebook = inngestClient.createFunction(
   {
-  id: "query-notebook",
-  retries: 3,
-  triggers: [{event: "notebook/query.requested"}],
+    id: "query-notebook",
+    retries: 3,
+    triggers: [{ event: "notebook/query.requested" }],
   },
   async ({ event, step }) => {
-    const {
-      notebookId,
-      query,
-      requestId,
-      topK,
-    } = event.data;
+    const { notebookId, query, requestId, topK } = event.data;
 
-    const channel = queryChannel({
-      requestId,
-    });
-
+    const channel = queryChannel({ requestId });
     const normalizedQuery = query.trim();
 
     // 1. Build query variants
-    const variantPlan = await step.run(
-      "build-query-variants",
-      async () => {
-        return buildQueryVariants(normalizedQuery);
-      },
-    );
+    const variantPlan = await step.run("build-query-variants", async () => {
+      return buildQueryVariants(normalizedQuery);
+    });
 
     // 2. Retrieve relevant chunks
-    const chunks = await step.run(
-      "retrieve-relevant-chunks",
-      async () => {
-        return retrieveRelevantChunks({
-          notebookId,
-          variants: variantPlan.variants,
-          topK,
-        });
-      },
-    );
+    const chunks = await step.run("retrieve-relevant-chunks", async () => {
+      return retrieveRelevantChunks({
+        notebookId,
+        variants: variantPlan.variants,
+        topK,
+      });
+    });
 
     // 3. No relevant chunks
     if (chunks.length === 0) {
-      await inngestClient.realtime.publish(
-        channel.token,
-        {
+      await step.run("publish-empty-answer", async () => {
+        await inngestClient.realtime.publish(channel.token, {
           content:
             "I couldn't find anything in this notebook's sources that answers that question.",
-        },
-      );
+        });
+      });
 
-      await step.realtime.publish(
-        "query-done",
-        channel.done,
-        {
-          citations: [],
-        },
-      );
+      await step.realtime.publish("query-done", channel.done, {
+        citations: [],
+      });
 
-      return {
-        notebookId,
-        query: normalizedQuery,
-        chunksFound: 0,
-      };
+      return { notebookId, query: normalizedQuery, chunksFound: 0 };
     }
 
-    // 4. Stream grounded answer
-    await streamGroundedAnswer({
-      query: normalizedQuery,
-      chunks,
+    // 4. Stream the grounded answer inside ONE step, so it runs once
+    const result = await step.run("generate-answer", async () => {
+      let citations = [];
+      let errorMessage = null;
 
-      writeEvent: async (payload) => {
-        if (payload.type === "token") {
-          // High-frequency token streaming:
-          // intentionally non-durable
-          await inngestClient.realtime.publish(
-            channel.token,
-            {
-              content: payload.content,
-            },
-          );
-        }
+      // Send tokens in small batches instead of one HTTP call per token
+      let buffer = "";
+      let lastFlush = Date.now();
 
-        if (payload.type === "done") {
-          // Final result: durable
-          await step.realtime.publish(
-            "query-done",
-            channel.done,
-            {
-              citations: payload.citations ?? [],
-            },
-          );
-        }
+      const flush = async () => {
+        if (!buffer) return;
+        const content = buffer;
+        buffer = "";
+        lastFlush = Date.now();
+        await inngestClient.realtime.publish(channel.token, { content });
+      };
 
-        if (payload.type === "error") {
-          await step.realtime.publish(
-            "query-error",
-            channel.error,
-            {
-              message: payload.message ?? "Query failed",
-            },
-          );
-        }
-      },
+      await streamGroundedAnswer({
+        query: normalizedQuery,
+        chunks,
+        writeEvent: async (payload) => {
+          if (payload.type === "token") {
+            buffer += payload.content;
+            if (buffer.length >= 30 || Date.now() - lastFlush >= 150) {
+              await flush();
+            }
+          } else if (payload.type === "done") {
+            await flush();
+            citations = payload.citations ?? [];
+          } else if (payload.type === "error") {
+            await flush();
+            errorMessage = payload.message ?? "Query failed";
+          }
+        },
+      });
+
+      await flush();
+      return { citations, errorMessage };
     });
+
+    // 5. Durable final events, published after the streaming step finishes
+    if (result.errorMessage) {
+      await step.realtime.publish("query-error", channel.error, {
+        message: result.errorMessage,
+      });
+    } else {
+      await step.realtime.publish("query-done", channel.done, {
+        citations: result.citations,
+      });
+    }
 
     return {
       notebookId,
