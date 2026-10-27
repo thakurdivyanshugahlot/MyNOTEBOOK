@@ -12,6 +12,7 @@ import {
   Citation,
   QuerySession,
   startQuery,
+  getRealtimeToken,
 } from "@/lib/api";
 
 import CitationBadge from "./CitationBadge";
@@ -240,24 +241,38 @@ export default function ChatPanel({
   // --------------------------------------------------
 
   const realtimeChannel = querySession
-  ? queryChannel({
-      requestId: querySession.requestId,
-    })
-  : undefined;
+    ? queryChannel({
+        requestId: querySession.requestId,
+      })
+    : undefined;
 
   const realtimeTopics = ["token", "done", "error"] as const;
 
-const {
-  messages: realtimeMessages,
-  error: realtimeError,
-} = useRealtime({
-  channel: realtimeChannel,
-  topics: realtimeTopics,
-  token: querySession?.realtimeToken,
-  key: querySession?.requestId,
-  enabled: !!querySession,
-  bufferInterval: 50,
-});
+  // The token is a factory so a fresh token is minted on mount
+  // and again on every reconnect, instead of reusing a stale one.
+  const {
+    messages: realtimeMessages,
+    error: realtimeError,
+  } = useRealtime({
+    channel: realtimeChannel,
+    topics: realtimeTopics,
+    token: querySession
+      ? async () => {
+          const t = await getRealtimeToken(
+            notebookId,
+            querySession.requestId,
+          );
+
+          return {
+            key: t.key,
+            apiBaseUrl: t.apiBaseUrl,
+          };
+        }
+      : undefined,
+    key: querySession?.requestId,
+    enabled: !!querySession,
+    bufferInterval: 50,
+  });
 
   // --------------------------------------------------
   // Scroll chat to bottom
@@ -387,12 +402,21 @@ const {
 
   // --------------------------------------------------
   // Realtime connection error
+  //
+  // realtimeError can be a raw WebSocket Event (no .message),
+  // so only read .message when it is a real Error, and keep
+  // any partial answer instead of wiping it.
   // --------------------------------------------------
 
   useEffect(() => {
     if (!realtimeError || !querySession) {
       return;
     }
+
+    const detail =
+      realtimeError instanceof Error
+        ? realtimeError.message
+        : "Lost connection to the answer stream. Please try again.";
 
     setMessages((prev) => {
       const next = [...prev];
@@ -405,7 +429,9 @@ const {
 
       next[next.length - 1] = {
         ...last,
-        content: `Something went wrong: ${realtimeError.message}`,
+        content: last.content
+          ? `${last.content}\n\n_(${detail})_`
+          : `Something went wrong: ${detail}`,
         streaming: false,
       };
 

@@ -311,3 +311,35 @@ export async function startQuery(
     realtimeToken: data.realtimeToken,
   };
 }
+
+// --------------------------------------------------
+// Fresh realtime token
+//
+// Called by useRealtime's token factory on mount and on
+// every reconnect, so the WebSocket never reuses a stale
+// token.
+// --------------------------------------------------
+
+export async function getRealtimeToken(
+  notebookId: string,
+  requestId: string,
+): Promise<RealtimeToken> {
+  const res = await fetch(
+    `${API_URL}/notebooks/${notebookId}/query/${requestId}/token`,
+    {
+      method: "POST",
+      headers: await authHeaders(),
+    },
+  );
+
+  const data = await handle<{
+    success: true;
+    key: string;
+    apiBaseUrl: string;
+  }>(res);
+
+  return {
+    key: data.key,
+    apiBaseUrl: data.apiBaseUrl,
+  };
+}

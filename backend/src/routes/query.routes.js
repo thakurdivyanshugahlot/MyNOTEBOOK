@@ -42,31 +42,31 @@ router.post("/notebooks/:notebookId/query", async (req, res) => {
 
     // Server-side realtime token.
     const realtimeToken = await inngestClient.realtime.token({
-  channel,
-  topics: ["token", "done", "error"],
-});
+      channel,
+      topics: ["token", "done", "error"],
+    });
 
     await inngestClient.send({
-  name: "notebook/query.requested",
-  data: {
-    requestId,
-    notebookId,
-    query: query.trim(),
-    topK: TOP_K,
-  },
-});
+      name: "notebook/query.requested",
+      data: {
+        requestId,
+        notebookId,
+        query: query.trim(),
+        topK: TOP_K,
+      },
+    });
 
     return res.status(202).json({
-  success: true,
-  requestId,
-  // Only send key + apiBaseUrl — never forward `channel`/`topics`,
-  // since JSON.stringify strips the schema's `validate` function and
-  // useRealtime would then trust this broken channel over its own local one.
-  realtimeToken: {
-    key: realtimeToken.key,
-    apiBaseUrl: realtimeToken.apiBaseUrl,
-  },
-});
+      success: true,
+      requestId,
+      // Only send key + apiBaseUrl — never forward `channel`/`topics`,
+      // since JSON.stringify strips the schema's `validate` function and
+      // useRealtime would then trust this broken channel over its own local one.
+      realtimeToken: {
+        key: realtimeToken.key,
+        apiBaseUrl: realtimeToken.apiBaseUrl,
+      },
+    });
   } catch (err) {
     console.error("Failed to start query:", err);
 
@@ -76,5 +76,45 @@ router.post("/notebooks/:notebookId/query", async (req, res) => {
     });
   }
 });
+
+// Mints a fresh realtime token for an existing request.
+// Used by the frontend's useRealtime token factory (mount + reconnect).
+router.post(
+  "/notebooks/:notebookId/query/:requestId/token",
+  async (req, res) => {
+    const { notebookId, requestId } = req.params;
+
+    const notebook = await prisma.notebook.findUnique({
+      where: { id: notebookId },
+    });
+
+    if (!notebook || notebook.userId !== currentUserId(req)) {
+      return res.status(404).json({
+        success: false,
+        error: "Notebook not found",
+      });
+    }
+
+    try {
+      const token = await inngestClient.realtime.token({
+        channel: queryChannel({ requestId }),
+        topics: ["token", "done", "error"],
+      });
+
+      return res.json({
+        success: true,
+        key: token.key,
+        apiBaseUrl: token.apiBaseUrl,
+      });
+    } catch (err) {
+      console.error("Failed to mint realtime token:", err);
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to mint realtime token",
+      });
+    }
+  },
+);
 
 export default router;
