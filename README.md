@@ -7,7 +7,7 @@ private to your account.
 
 ```
 MyNOTEBOOK/
-├── backend/     Express API + Inngest workflows + Qdrant + SQLite (Prisma)
+├── backend/     Express API + Inngest workflows + Qdrant + Prisma
 └── frontend/    Next.js (App Router) UI
 ```
 
@@ -33,10 +33,11 @@ Upload/link → authenticated API creates a source row (status: uploading)
 **Querying (async + streamed via Inngest realtime):**
 ```
 Question → authenticated API validates it and sends "notebook/query.requested"
+         → API returns a request ID; the browser fetches a short-lived realtime token
          → queryNotebook rewrites and expands the question, including HyDE
          → searches Qdrant for each variant, filtered to this notebook
          → reciprocal rank fusion selects the most relevant chunks
-         → OpenAI streams an answer grounded in those chunks
+         → OpenAI streams an answer grounded in those chunks (one Inngest step)
          → Inngest Realtime sends answer tokens and a final event with citations
 ```
 
@@ -60,7 +61,7 @@ Websites and YouTube videos can be opened at their original URL or cited
 timestamp. Uploaded files have no public URL, so the modal shows the excerpt
 and any available page or timestamp metadata.
 
-## Setup
+## Local setup
 
 ### 1. Start Qdrant
 ```bash
@@ -82,8 +83,9 @@ npm run prisma:migrate
 
 Create `backend/.env` from `.env.example` (PowerShell: `Copy-Item .env.example
 .env`; macOS/Linux: `cp .env.example .env`) and set the required OpenAI and
-Clerk credentials. `QDRANT_API_KEY` is only needed when your Qdrant instance
-requires authentication. Create the upload directory if it does not exist
+Clerk credentials. For local development also set `INNGEST_DEV=1`.
+`QDRANT_API_KEY` is only needed when your Qdrant instance requires
+authentication. Create the upload directory if it does not exist
 (PowerShell: `New-Item -ItemType Directory -Force uploads`; macOS/Linux:
 `mkdir -p uploads`).
 
@@ -92,7 +94,8 @@ Start the API in one terminal:
 npm start
 ```
 
-Start the Inngest development server in another terminal, from `backend`:
+Start the Inngest development server in another terminal, from `backend`
+(source indexing and chat will fail with `ECONNREFUSED` if it is not running):
 ```bash
 npx --ignore-scripts=false inngest-cli@latest dev -u http://localhost:8000/api/inngest
 ```
@@ -121,23 +124,31 @@ wait for its status to become `ready` before asking questions.
 | Var | Purpose |
 |---|---|
 | `PORT` | API port (default 8000) |
-| `DATABASE_URL` | SQLite file path for Prisma, e.g. `file:./dev.db` |
-| `QDRANT_URL` | Qdrant REST endpoint, e.g. `http://localhost:6333` |
-| `QDRANT_API_KEY` | API key for Qdrant if your instance requires authentication |
+| `DATABASE_URL` | Prisma database URL. Local: a SQLite path like `file:./dev.db`. Hosted: a persistent database (see Deployment) |
+| `QDRANT_URL` | Qdrant REST endpoint, e.g. `http://localhost:6333` (local) or your Qdrant Cloud URL |
+| `QDRANT_API_KEY` | API key for Qdrant if your instance requires authentication (required on Qdrant Cloud) |
 | `QDRANT_COLLECTION` | Collection name for all source vectors |
 | `OPENAI_API_KEY` | Used for embeddings + chat completions |
-| `OPENAI_CHAT_MODEL` | Chat model for answers (default `gpt-4o-mini`) |
+| `OPENAI_CHAT_MODEL` | Chat model for answers |
 | `OPENAI_EMBEDDING_MODEL` | Embedding model (default `text-embedding-3-small`, 1536-dim) |
 | `EMBEDDING_DIM` | Must match the embedding model's output size |
 | `UPLOAD_DIR` | Where uploaded files land before/while being parsed |
 | `RETRIEVAL_TOP_K` | How many chunks to retrieve per query (default 6) |
 | `CLERK_SECRET_KEY` | Clerk secret key used by the backend to validate authenticated requests |
+| `CLERK_PUBLISHABLE_KEY` | Clerk publishable key (same Clerk application as the frontend) |
+| `INNGEST_DEV` | Set to `1` for local development with the Inngest Dev Server. Leave unset in production |
+| `INNGEST_SIGNING_KEY` | Production only: signing key from the Inngest dashboard (Production environment) |
+| `INNGEST_EVENT_KEY` | Production only: event key from the Inngest dashboard |
 
-**frontend/.env.local**
+**frontend/.env.local** (and Vercel environment variables)
 | Var | Purpose |
 |---|---|
-| `NEXT_PUBLIC_API_URL` | Backend base URL, e.g. `http://localhost:8000/api` |
+| `NEXT_PUBLIC_API_URL` | Backend base URL **including `/api`**, no trailing slash, e.g. `http://localhost:8000/api` |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Clerk publishable key for frontend sign-in and session tokens |
+| `CLERK_SECRET_KEY` | Clerk secret key, same Clerk application as the backend |
+
+`NEXT_PUBLIC_*` variables are baked in at build time, so redeploy the frontend
+after changing them.
 
 ## API reference
 
@@ -154,15 +165,57 @@ wait for its status to become `ready` before asking questions.
 | DELETE | `/api/sources/:id` | Remove a source (vectors + file + row) |
 | POST | `/api/sources/:id/reindex` | Re-run indexing for a source |
 | POST | `/api/notebooks/:id/query` | Validates input, returns a request ID and realtime token, and emits an Inngest query event |
+| POST | `/api/notebooks/:id/query/:requestId/token` | Mints a fresh realtime token for an existing request (used on connect and reconnect) |
 
 All notebook and source routes require a valid Clerk session. The frontend
 passes its session token to the backend as a bearer token.
+
+## Deployment
+
+The repo is a monorepo. Deploy the same repository twice, once per folder.
+
+| Part | Host | Root directory |
+|---|---|---|
+| Backend (Express + Inngest endpoint) | Render (Web Service) | `backend` |
+| Frontend (Next.js) | Vercel | `frontend` |
+| Vector database | Qdrant Cloud (free cluster) | — |
+| Relational database | A persistent hosted database, e.g. Postgres on Neon or Supabase | — |
+
+**Backend on Render**
+- Build command: `npm install && npx prisma migrate deploy` (the `postinstall`
+  script runs `prisma generate`).
+- Start command: `npm start`
+- Set the backend environment variables above, including `DATABASE_URL`,
+  `QDRANT_URL`, `QDRANT_API_KEY`, the Clerk keys, `OPENAI_API_KEY`,
+  `INNGEST_SIGNING_KEY`, and `INNGEST_EVENT_KEY`. Do not set `INNGEST_DEV`.
+
+**Sync the app with Inngest Cloud**
+- In the Inngest dashboard (Production), go to Apps → Sync New App and enter
+  `https://<your-backend>.onrender.com/api/inngest`.
+- Sync again after any deploy that adds, removes, or renames Inngest functions
+  or steps.
+
+**Frontend on Vercel**
+- Import the repo, set the root directory to `frontend`, and add
+  `NEXT_PUBLIC_API_URL` (ending in `/api`) and the Clerk keys. Redeploy after
+  changing any `NEXT_PUBLIC_*` variable.
+- Use the same Clerk application's keys on Vercel and Render.
 
 ## Known limitations
 
 - Website parsing is a lightweight fetch + HTML-strip — pages that render
   content client-side via JS won't extract well (no headless browser).
 - YouTube transcript fetch depends on the video having captions available;
-  videos without any caption track can't be indexed.
+  videos without any caption track can't be indexed. On the hosted version,
+  YouTube may also block requests from the server's cloud IP, so indexing can
+  fail even for videos that have captions. The source is then marked `failed`
+  with a message; upload the transcript as a VTT/SRT/text file instead.
 - Citations for uploaded files show the excerpt in a modal; PDFs are not
   rendered in an inline page-anchored viewer.
+- Uploaded files are stored on the server's local disk, which is temporary on
+  most free hosts. Indexing happens right after upload, but files can be gone
+  after a restart.
+- On free hosting tiers the backend sleeps when idle, so the first request
+  after a pause can take 30–60 seconds.
+- The Qdrant JS client must use `query()` (not the removed `search()`); keep the
+  client version and the code in `query.service.js` in sync.

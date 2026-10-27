@@ -127,6 +127,26 @@ export default function SourceUploadModal({
               }
               className="w-full border border-neutral-300 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-accent"
             />
+
+            {tab === "youtube" && (
+              <p className="text-xs text-neutral-500 leading-relaxed bg-white border border-neutral-200 rounded-lg px-3 py-2">
+                YouTube indexing needs the video&apos;s captions, and it can fail
+                on the hosted version if YouTube blocks the server. If it does,{" "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTab("vtt");
+                    setError(null);
+                    setFileName(null);
+                  }}
+                  className="text-accent underline"
+                >
+                  upload the transcript as a file
+                </button>{" "}
+                instead.
+              </p>
+            )}
+
             {error && <p className="text-sm text-red-600">{error}</p>}
             <button
               onClick={handleLinkSubmit}
