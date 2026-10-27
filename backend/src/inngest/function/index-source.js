@@ -3,6 +3,8 @@ import "dotenv/config";
 import fs from "fs/promises";
 import crypto from "crypto";
 
+import { NonRetriableError } from "inngest";
+
 import { inngestClient } from "../client.js";
 
 import { prisma } from "../../config/prisma.js";
@@ -14,6 +16,7 @@ import {
 } from "../../config/qdrant.js";
 
 import { parseSource } from "../../parsers/parseSource.js";
+import { YOUTUBE_CAPTIONS_MARKER } from "../../parsers/youtubeParser.js";
 
 import {
   chunkPlainText,
@@ -22,6 +25,27 @@ import {
 } from "../../utils/chunker.js";
 
 import { generateEmbeddings } from "../../services/embedding.service.js";
+
+const YOUTUBE_FRIENDLY_MESSAGE =
+  "Couldn't fetch captions for this YouTube video. It may have no captions, " +
+  "or YouTube may be blocking this server. Try uploading the transcript as a " +
+  "VTT/SRT/text file instead.";
+
+// --------------------------------------------------
+// Turn an internal error into a message safe to show
+// on the source card.
+// --------------------------------------------------
+function userFacingMessage(err) {
+  const message = String(err?.message || err || "");
+
+  if (message.includes(YOUTUBE_CAPTIONS_MARKER)) {
+    return YOUTUBE_FRIENDLY_MESSAGE;
+  }
+
+  if (!message) return "Indexing failed";
+
+  return message.length > 300 ? `${message.slice(0, 300)}…` : message;
+}
 
 // --------------------------------------------------
 // Create a deterministic UUID for Qdrant points.
@@ -120,150 +144,194 @@ export const indexSource = inngestClient.createFunction(
     //
     // We keep parsed/chunks/embeddings/points in memory
     // inside this step and only return a small result.
+    //
+    // If this step fails for good, the source is marked
+    // "failed" with a readable message instead of being
+    // left stuck on "indexing".
     // --------------------------------------------------
-    const indexingResult = await step.run(
-      "process-and-store",
-      async () => {
-        // ----------------------------------------------
-        // Parse
-        // ----------------------------------------------
-        const parsed = await parseSource(source);
+    let indexingResult;
 
-        // ----------------------------------------------
-        // Chunk
-        // ----------------------------------------------
-        const chunks =
-          parsed.type === "subtitle"
-            ? chunkSubtitleCues(parsed.cues)
-            : parsed.pageTexts
-              ? chunkPlainTextWithPages(parsed.pageTexts)
-              : chunkPlainText(parsed.text);
+    try {
+      indexingResult = await step.run(
+        "process-and-store",
+        async () => {
+          // ----------------------------------------------
+          // Parse
+          // ----------------------------------------------
+          let parsed;
 
-        if (chunks.length === 0) {
-          throw new Error(
-            `No extractable content found in "${source.originalName}"`,
-          );
-        }
+          try {
+            parsed = await parseSource(source);
+          } catch (err) {
+            // Missing/blocked YouTube captions never fix
+            // themselves, so don't waste retries on them.
+            if (
+              String(err?.message || err).includes(
+                YOUTUBE_CAPTIONS_MARKER,
+              )
+            ) {
+              throw new NonRetriableError(
+                `${YOUTUBE_CAPTIONS_MARKER}: ${err.message}`,
+              );
+            }
 
-        console.log(
-          `[Indexing] Source ${sourceId}: ${chunks.length} chunks created`,
-        );
+            throw err;
+          }
 
-        // ----------------------------------------------
-        // Embed + store in batches
-        // ----------------------------------------------
-        const BATCH_SIZE = Number(
-          process.env.EMBEDDING_BATCH_SIZE || 50,
-        );
+          // ----------------------------------------------
+          // Chunk
+          // ----------------------------------------------
+          const chunks =
+            parsed.type === "subtitle"
+              ? chunkSubtitleCues(parsed.cues)
+              : parsed.pageTexts
+                ? chunkPlainTextWithPages(parsed.pageTexts)
+                : chunkPlainText(parsed.text);
 
-        let indexedCount = 0;
-
-        for (
-          let start = 0;
-          start < chunks.length;
-          start += BATCH_SIZE
-        ) {
-          const batch = chunks.slice(
-            start,
-            start + BATCH_SIZE,
-          );
-
-          console.log(
-            `[Indexing] Source ${sourceId}: processing chunks ${
-              start + 1
-            }-${Math.min(start + BATCH_SIZE, chunks.length)} of ${
-              chunks.length
-            }`,
-          );
-
-          // --------------------------------------------
-          // Generate embeddings only for this batch
-          // --------------------------------------------
-          const embeddings = await generateEmbeddings(
-            batch.map((chunk) => chunk.text),
-          );
-
-          if (embeddings.length !== batch.length) {
+          if (chunks.length === 0) {
             throw new Error(
-              `Embedding count mismatch: received ${embeddings.length} embeddings for ${batch.length} chunks`,
+              `No extractable content found in "${source.originalName}"`,
             );
           }
 
-          // --------------------------------------------
-          // Create Qdrant points
-          // --------------------------------------------
-          const points = batch.map((chunk, index) => {
-            const chunkIndex =
-              chunk.metadata?.chunkIndex ?? start + index;
-
-            return {
-              id: createChunkPointId(
-                source.id,
-                chunkIndex,
-              ),
-
-              vector: embeddings[index],
-
-              payload: {
-                notebookId: source.notebookId,
-
-                sourceId: source.id,
-
-                sourceName: source.originalName,
-
-                sourceType: source.type,
-
-                sourceUrl: source.sourceUrl ?? null,
-
-                text: chunk.text,
-
-                chunkIndex,
-
-                startPage:
-                  chunk.metadata?.startPage ?? null,
-
-                endPage:
-                  chunk.metadata?.endPage ?? null,
-
-                startTime:
-                  chunk.metadata?.startTime ?? null,
-
-                endTime:
-                  chunk.metadata?.endTime ?? null,
-
-                startTimestamp:
-                  chunk.metadata?.startTimestamp ?? null,
-
-                endTimestamp:
-                  chunk.metadata?.endTimestamp ?? null,
-              },
-            };
-          });
-
-          // --------------------------------------------
-          // Upsert this batch
-          // --------------------------------------------
-          await qdrantClient.upsert(
-            COLLECTION_NAME,
-            {
-              points,
-            },
+          console.log(
+            `[Indexing] Source ${sourceId}: ${chunks.length} chunks created`,
           );
 
-          indexedCount += points.length;
-        }
+          // ----------------------------------------------
+          // Embed + store in batches
+          // ----------------------------------------------
+          const BATCH_SIZE = Number(
+            process.env.EMBEDDING_BATCH_SIZE || 50,
+          );
 
-        console.log(
-          `[Indexing] Source ${sourceId}: ${indexedCount} chunks indexed successfully`,
-        );
+          let indexedCount = 0;
 
-        // IMPORTANT:
-        // Return ONLY small metadata.
-        return {
-          chunksIndexed: indexedCount,
-        };
-      },
-    );
+          for (
+            let start = 0;
+            start < chunks.length;
+            start += BATCH_SIZE
+          ) {
+            const batch = chunks.slice(
+              start,
+              start + BATCH_SIZE,
+            );
+
+            console.log(
+              `[Indexing] Source ${sourceId}: processing chunks ${
+                start + 1
+              }-${Math.min(start + BATCH_SIZE, chunks.length)} of ${
+                chunks.length
+              }`,
+            );
+
+            // --------------------------------------------
+            // Generate embeddings only for this batch
+            // --------------------------------------------
+            const embeddings = await generateEmbeddings(
+              batch.map((chunk) => chunk.text),
+            );
+
+            if (embeddings.length !== batch.length) {
+              throw new Error(
+                `Embedding count mismatch: received ${embeddings.length} embeddings for ${batch.length} chunks`,
+              );
+            }
+
+            // --------------------------------------------
+            // Create Qdrant points
+            // --------------------------------------------
+            const points = batch.map((chunk, index) => {
+              const chunkIndex =
+                chunk.metadata?.chunkIndex ?? start + index;
+
+              return {
+                id: createChunkPointId(
+                  source.id,
+                  chunkIndex,
+                ),
+
+                vector: embeddings[index],
+
+                payload: {
+                  notebookId: source.notebookId,
+
+                  sourceId: source.id,
+
+                  sourceName: source.originalName,
+
+                  sourceType: source.type,
+
+                  sourceUrl: source.sourceUrl ?? null,
+
+                  text: chunk.text,
+
+                  chunkIndex,
+
+                  startPage:
+                    chunk.metadata?.startPage ?? null,
+
+                  endPage:
+                    chunk.metadata?.endPage ?? null,
+
+                  startTime:
+                    chunk.metadata?.startTime ?? null,
+
+                  endTime:
+                    chunk.metadata?.endTime ?? null,
+
+                  startTimestamp:
+                    chunk.metadata?.startTimestamp ?? null,
+
+                  endTimestamp:
+                    chunk.metadata?.endTimestamp ?? null,
+                },
+              };
+            });
+
+            // --------------------------------------------
+            // Upsert this batch
+            // --------------------------------------------
+            await qdrantClient.upsert(
+              COLLECTION_NAME,
+              {
+                points,
+              },
+            );
+
+            indexedCount += points.length;
+          }
+
+          console.log(
+            `[Indexing] Source ${sourceId}: ${indexedCount} chunks indexed successfully`,
+          );
+
+          // IMPORTANT:
+          // Return ONLY small metadata.
+          return {
+            chunksIndexed: indexedCount,
+          };
+        },
+      );
+    } catch (err) {
+      const message = userFacingMessage(err);
+
+      await step.run("mark-source-failed", async () => {
+        await prisma.source.update({
+          where: {
+            id: sourceId,
+          },
+
+          data: {
+            status: "failed",
+            errorMessage: message,
+          },
+        });
+      });
+
+      // End the run as failed, without further retries.
+      throw new NonRetriableError(message);
+    }
 
     // --------------------------------------------------
     // 5. Mark source as ready
